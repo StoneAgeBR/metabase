@@ -5,9 +5,9 @@ import type {
   Formatter,
   RenderingContext,
 } from "metabase/visualizations/types";
-import { computeMaxDecimalsForValues } from "metabase/visualizations/lib/utils";
 
 import type { PieChartModel, PieSlice } from "../model/types";
+import type { PieChartFormatters } from "../format";
 import { SUNBURST_SERIES_OPTION, TOTAL_GRAPHIC_OPTION } from "./constants";
 
 function getSliceByKey(key: string, slices: PieSlice[]) {
@@ -45,43 +45,20 @@ function getTotalGraphicOption(
 
 export function getPieChartOption(
   chartModel: PieChartModel,
+  formatters: PieChartFormatters,
   settings: ComputedVisualizationSettings,
   renderingContext: RenderingContext,
 ): EChartsOption {
-  const { column: getColumnSettings } = settings;
-  if (!getColumnSettings) {
-    throw Error(`"settings.column" is undefined`);
-  }
-  const metricColSettings = getColumnSettings(
-    chartModel.colDescs.metricDesc.column,
-  );
-
   // "Show total" setting
-  const formatMetric = (value: unknown) =>
-    renderingContext.formatValue(value, {
-      ...metricColSettings,
-    });
-
   const graphicOption = settings["pie.show_total"]
-    ? getTotalGraphicOption(chartModel.total, formatMetric, renderingContext)
+    ? getTotalGraphicOption(
+        chartModel.total,
+        formatters.formatMetric,
+        renderingContext,
+      )
     : undefined;
 
   // "Show percentages: On the chart" setting
-  const formatPercent = (value: unknown) =>
-    renderingContext.formatValue(value, {
-      column: metricColSettings.column,
-      number_separators: metricColSettings.number_separators,
-      number_style: "percent",
-      jsx: true,
-      decimals: computeMaxDecimalsForValues(
-        chartModel.slices.map(s => s.normalizedPercentage),
-        {
-          style: "percent",
-          maximumSignificantDigits: 2,
-        },
-      ),
-    });
-
   const seriesOption = { ...SUNBURST_SERIES_OPTION };
   if (!seriesOption.label) {
     throw Error(`"seriesOption.label" is undefined`);
@@ -91,7 +68,7 @@ export function getPieChartOption(
       return " ";
     }
 
-    return formatPercent(
+    return formatters.formatPercent(
       getSliceByKey(name, chartModel.slices).normalizedPercentage,
     );
   };
