@@ -166,7 +166,7 @@ jobs:
     if: |
       !cancelled() &&
       (needs.download_uberjar.result == 'success' || needs.build.result == 'success')
-    runs-on: ${{ matrix.runner }}
+    runs-on: buildjet-4vcpu-ubuntu-2204 # just testing, don't leave this
     timeout-minutes: 90
     name: e2e-tests-${{ matrix.name }}-${{ matrix.edition }}
     env:
