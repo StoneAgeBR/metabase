@@ -1778,3 +1778,13 @@
                                           :id db-id))))
             (testing "it's okay to unpersist even though the database is not persisted"
               (mt/user-http-request :crowberto :post 204 (str "database/" db-id "/unpersist")))))))))
+
+;; ------------- can't modify the internal db via the database-api
+(deftest audit-db-unmodifiable
+  (testing "no users can unpersist the audit database"
+    (doseq [[verb path] [[:post "database/%d/unpersist"]
+                         [:put "database/%d"]
+                         [:get "database/%d/syncable_schemas"]]
+            user [:crowberto :lucky]]
+      (is (= "You don't have permissions to do that."
+             (mt/user-http-request user verb 403 (format path (perms/default-audit-db-id))))))))
