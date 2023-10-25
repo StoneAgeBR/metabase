@@ -757,8 +757,9 @@ saved later when it is ready."
 
   (let [card (t2/select-one Card :id id)]
     (delete-alerts-if-needed! card-before-update card)
+    ;; if these changes are not changes to the card itself, don't fire the :event/card-update event
     (when-not (set/subset? (set (keys card-updates))
-                           #{:archived})
+                           #{:archived :collection_position})
       (events/publish-event! :event/card-update (assoc card :actor_id api/*current-user-id*)))
     ;; include same information returned by GET /api/card/:id since frontend replaces the Card it currently
     ;; has with returned one -- See #4142

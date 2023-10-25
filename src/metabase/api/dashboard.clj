@@ -443,7 +443,9 @@
         (t2/update! Dashboard id updates))))
   ;; now publish an event and return the updated Dashboard
   (let [dashboard (t2/select-one :model/Dashboard :id id)]
-    (events/publish-event! :event/dashboard-update (assoc dashboard :actor_id api/*current-user-id*))
+    (when-not (set/subset? (set (keys dash-updates))
+                           #{:collection_position})
+      (events/publish-event! :event/dashboard-update (assoc dashboard :actor_id api/*current-user-id*)))
     (assoc dashboard :last-edit-info (last-edit/edit-information-for-user @api/*current-user*))))
 
 ;; TODO - We can probably remove this in the near future since it should no longer be needed now that we're going to
