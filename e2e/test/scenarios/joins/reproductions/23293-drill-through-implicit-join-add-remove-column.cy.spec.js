@@ -88,8 +88,16 @@ function saveQuestion() {
   cy.intercept("POST", "/api/card").as("saveQuestion");
 
   cy.findByTestId("qb-header-action-panel").findByText("Save").click();
-  cy.get(".Modal").button("Save").click();
-  cy.get(".Modal").button("Not now").click();
+  cy.get(".Modal").within(() => {
+    cy.button("Save").click();
+    // Make sure the forms in the modal are gone from the DOM after the save
+    cy.findByLabelText("Name").should("not.be.visible");
+  });
+
+  // Rather than trying to find "Not now" (when asked to save the question to the dashboard),
+  // we're simply closing the modal. Trying to find and click "Not now" led to numerous flakes
+  // due to some weird out-of-sync transitions in the FE code related to the save question modal.
+  cy.get(".Modal").icon("close");
 
   return cy.wait("@saveQuestion");
 }
