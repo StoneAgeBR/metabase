@@ -13,6 +13,7 @@
    [metabase.api.dataset :as api.dataset]
    [metabase.automagic-dashboards.populate :as populate]
    [metabase.events :as events]
+   [metabase.mbql.normalize :as mbql.normalize]
    [metabase.mbql.schema :as mbql.s]
    [metabase.mbql.util :as mbql.u]
    [metabase.models.card :refer [Card]]
@@ -463,8 +464,7 @@
   api/generic-204-no-content)
 
 (defn- param-target->field-id [target query]
-  (when-let [field-clause (:dimension
-                           (params/param-target->template-tag target {:dataset_query query}))]
+  (when-let [field-clause (params/param-target->field-clause target {:dataset_query query})]
     (mbql.u/match-one field-clause [:field (id :guard integer?) _] id)))
 
 ;; TODO -- should we only check *new* or *modified* mappings?
@@ -786,26 +786,38 @@
   "How many results to return when chain filtering"
   1000)
 
+(defn- find-template-tag
+  "Fetch the `:field` clause from `dashcard` referenced by `template-tag`.
+
+    (find-template-tag [:template-tag :company] some-dashcard) ; -> [:field 100 nil]"
+  [dimension card]
+  (when-let [tag (first (mbql.u/get-clause :template-tag dimension))]
+    (get-in card [:dataset_query :native :template-tags (u/qualified-name tag)])))
+
 (mu/defn ^:private mappings->fields :- [:maybe [:set [:map
-                                                         [:field-id ms/PositiveInt]
-                                                         [:options [:maybe map?]]]]]
+                                                      [:field-id ms/PositiveInt]
+                                                      [:options [:maybe map?]]]]]
   [parameter-mappings :- [:maybe [:or [:set dashboard-card/ParamMapping] [:sequential dashboard-card/ParamMapping]]]]
-  (set (for [{{:keys [card]} :dashcard :keys [target]} parameter-mappings
-             :let  [ttag (params/param-target->template-tag target card)]
-             :when ttag
-             :let  [{:keys [result_metadata]} card
-                    options  (:options ttag)
-                    field-id (or
-                              ;; Get the field id from the field-clause if it contains it. This is the common case for
-                              ;; mbql queries.
-                              (mbql.u/match-one (:dimension ttag) [:field (id :guard integer?) _] id)
-                              ;; Attempt to get the field clause from the model metadata corresponding to the field.
-                              ;; This is the common case for native queries in which mappings from original columns
-                              ;; have been performed using model metadata.
-                              (:id (qp.util/field->field-info (:dimension ttag) result_metadata)))]
+  (set (for [{:keys [target] {:keys [card]} :dashcard} parameter-mappings
+             :let  [dimension (->> (mbql.normalize/normalize-tokens target :ignore-path)
+                                   (mbql.u/get-clause :dimension)
+                                   first)]
+             :when dimension
+             :let  [ttag      (find-template-tag dimension card)
+                    dimension (if ttag
+                                (:dimension ttag)
+                                dimension)
+                    field-id  (or
+                               ;; Get the field id from the field-clause if it contains it. This is the common case for
+                               ;; mbql queries.
+                               (mbql.u/match-one dimension [:field (id :guard integer?) _] id)
+                               ;; Attempt to get the field clause from the model metadata corresponding to the field.
+                               ;; This is the common case for native queries in which mappings from original columns
+                               ;; have been performed using model metadata.
+                               (:id (qp.util/field->field-info dimension (:result_metadata card))))]
              :when field-id]
          {:field-id field-id
-          :options  options})))
+          :options  (:options ttag)})))
 
 (defn- param-key->param
   "Get Field ID(s) associated with a parameter in a Dashboard.
