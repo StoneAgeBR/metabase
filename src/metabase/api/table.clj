@@ -101,36 +101,6 @@
       (sync-unhidden-tables newly-unhidden)
       updated-tables)))
 
-#_{:clj-kondo/ignore [:deprecated-var]}
-(api/defendpoint-schema PUT "/:id"
-  "Update `Table` with ID."
-  [id :as {{:keys [display_name entity_type visibility_type description caveats points_of_interest
-                   show_in_getting_started field_order], :as body} :body}]
-  {display_name            (s/maybe su/NonBlankString)
-   entity_type             (s/maybe su/EntityTypeKeywordOrString)
-   visibility_type         (s/maybe TableVisibilityType)
-   description             (s/maybe s/Str)
-   caveats                 (s/maybe s/Str)
-   points_of_interest      (s/maybe s/Str)
-   show_in_getting_started (s/maybe s/Bool)
-   field_order             (s/maybe FieldOrder)}
-  (first (update-tables! [id] body)))
-
-#_{:clj-kondo/ignore [:deprecated-var]}
-(api/defendpoint-schema PUT "/"
-  "Update all `Table` in `ids`."
-  [:as {{:keys [ids display_name entity_type visibility_type description caveats points_of_interest
-                show_in_getting_started], :as body} :body}]
-  {ids                     (su/non-empty [su/IntGreaterThanZero])
-   display_name            (s/maybe su/NonBlankString)
-   entity_type             (s/maybe su/EntityTypeKeywordOrString)
-   visibility_type         (s/maybe TableVisibilityType)
-   description             (s/maybe s/Str)
-   caveats                 (s/maybe s/Str)
-   points_of_interest      (s/maybe s/Str)
-   show_in_getting_started (s/maybe s/Bool)}
-  (update-tables! ids body))
-
 
 (def ^:private auto-bin-str (deferred-tru "Auto bin"))
 (def ^:private dont-bin-str (deferred-tru "Don''t bin"))
@@ -317,6 +287,9 @@
                 (update field :values field-values/field-values->pairs)
                 field)))))
 
+(defn remove-details [db]
+  (dissoc db :details :dbms_version))
+
 (defn fetch-query-metadata
   "Returns the query metadata used to power the Query Builder for the given `table`. `include-sensitive-fields?`,
   `include-hidden-fields?` and `include-editable-data-model?` can be either booleans or boolean strings."
@@ -324,12 +297,11 @@
   (if (Boolean/parseBoolean include-editable-data-model?)
     (api/write-check table)
     (api/read-check table))
-  (let [db                        (t2/select-one Database :id (:db_id table))
-        include-sensitive-fields? (cond-> include-sensitive-fields? (string? include-sensitive-fields?) Boolean/parseBoolean)
-        include-hidden-fields?    (cond-> include-hidden-fields? (string? include-hidden-fields?) Boolean/parseBoolean)]
+  (let [db (remove-details (t2/select-one Database :id (:db_id table)))]
     (-> table
         (t2/hydrate :db [:fields [:target :has_field_values] :dimensions :has_field_values] :segments :metrics)
         (m/dissoc-in [:db :details])
+        (m/dissoc-in [:db :dbms_version])
         (assoc-dimension-options db)
         format-fields-for-response
         (update :fields (partial filter (fn [{visibility-type :visibility_type}]

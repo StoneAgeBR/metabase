@@ -259,6 +259,9 @@
       ;; Perms checks for uploadable DBs are handled by exclude-uneditable-details? (see below)
       include-only-uploadable?     (#(filter uploadable-db? %)))))
 
+(defn remove-details [db]
+  (dissoc db :details :dbms_version))
+
 (api/defendpoint GET "/"
   "Fetch all `Databases`.
 
@@ -293,10 +296,10 @@
                                                       :exclude-uneditable-details?     only-editable?
                                                       :include-analytics?  include_analytics
                                                       :include-only-uploadable?        include_only_uploadable)
-                                            [])]
-    {:data  db-list-res
-     :total (count db-list-res)}))
-
+                                            [])
+        handled-db-list (map remove-details db-list-res)]
+   {:data  handled-db-list
+    :total (count db-list-res)}))
 
 ;;; --------------------------------------------- GET /api/database/:id ----------------------------------------------
 
@@ -351,8 +354,9 @@
   (let [include-editable-data-model? (Boolean/parseBoolean include_editable_data_model)
         exclude-uneditable-details?  (Boolean/parseBoolean exclude_uneditable_details)
         filter-by-data-access?       (not (or include-editable-data-model? exclude-uneditable-details?))
-        database                     (api/check-404 (t2/select-one Database :id id))]
-    (cond-> database
+        database                     (api/check-404 (t2/select-one Database :id id))
+        handled-db                   (remove-details database)]
+    (cond-> handled-db
       filter-by-data-access?       api/read-check
       exclude-uneditable-details?  api/write-check
       true                         add-expanded-schedules
@@ -449,14 +453,13 @@
              ;; We need to check data model perms after hydrating tables, since this will also filter out tables for
              ;; which the *current-user* does not have data model perms
              (check-db-data-model-perms db)
-             db)]
-    (-> db
-        (update :tables (if include-hidden?
-                          identity
-                          (fn [tables]
+             db)
+        handled-db (remove-details db)]
+    (-> handled-db
+        (update :tables (fn [tables]
                             (->> tables
                                  (remove :visibility_type)
-                                 (map #(update % :fields filter-sensitive-fields))))))
+                                 (map #(update % :fields filter-sensitive-fields)))))
         (update :tables (fn [tables]
                           (if-not include-editable-data-model?
                             ;; If we're filtering by data model perms, table perm checks were already done by
@@ -715,260 +718,6 @@
           (ex-data e)
           {:message (.getMessage e)})))))
 
-;; TODO - Just make `:ssl` a `feature`
-(defn- supports-ssl?
-  "Does the given `engine` have an `:ssl` setting?"
-  [driver]
-  {:pre [(driver/available? driver)]}
-  (let [driver-props (set (for [field (driver/connection-properties driver)]
-                            (:name field)))]
-    (contains? driver-props "ssl")))
-
-(s/defn ^:private test-connection-details :- su/Map
-  "Try a making a connection to database `engine` with `details`.
-
-  If the `details` has SSL explicitly enabled, go with that and do not accept plaintext connections. If it is disabled,
-  try twice: once with SSL, and a second time without if the first fails. If either attempt is successful, returns
-  the details used to successfully connect. Otherwise returns a map with the connection error message. (This map will
-  also contain the key `:valid` = `false`, which you can use to distinguish an error from valid details.)"
-  [engine :- DBEngineString, details :- su/Map]
-  (let [;; Try SSL first if SSL is supported and not already enabled
-        ;; If not successful or not applicable, details-with-ssl will be nil
-        details-with-ssl (assoc details :ssl true)
-        details-with-ssl (when (and (supports-ssl? (keyword engine))
-                                    (not (true? (:ssl details)))
-                                    (nil? (test-database-connection engine details-with-ssl :log-exception false)))
-                           details-with-ssl)]
-    (or
-      ;; Opportunistic SSL
-      details-with-ssl
-      ;; Try with original parameters
-      (some-> (test-database-connection engine details)
-              (assoc :valid false))
-      details)))
-
-#_{:clj-kondo/ignore [:deprecated-var]}
-(api/defendpoint-schema POST "/"
-  "Add a new `Database`."
-  [:as {{:keys [name engine details is_full_sync is_on_demand schedules auto_run_queries cache_ttl]} :body}]
-  {name             su/NonBlankString
-   engine           DBEngineString
-   details          su/Map
-   is_full_sync     (s/maybe s/Bool)
-   is_on_demand     (s/maybe s/Bool)
-   schedules        (s/maybe sync.schedules/ExpandedSchedulesMap)
-   auto_run_queries (s/maybe s/Bool)
-   cache_ttl        (s/maybe su/IntGreaterThanZero)}
-  (api/check-superuser)
-  (when cache_ttl
-    (api/check (premium-features/enable-cache-granular-controls?)
-               [402 (tru (str "The cache TTL database setting is only enabled if you have a premium token with the "
-                              "cache granular controls feature."))]))
-  (let [is-full-sync?    (or (nil? is_full_sync)
-                             (boolean is_full_sync))
-        details-or-error (test-connection-details engine details)
-        valid?           (not= (:valid details-or-error) false)]
-    (if valid?
-      ;; no error, proceed with creation. If record is inserted successfuly, publish a `:database-create` event.
-      ;; Throw a 500 if nothing is inserted
-      (u/prog1 (api/check-500 (first (t2/insert-returning-instances!
-                                      Database
-                                      (merge
-                                       {:name         name
-                                        :engine       engine
-                                        :details      details-or-error
-                                        :is_full_sync is-full-sync?
-                                        :is_on_demand (boolean is_on_demand)
-                                        :cache_ttl    cache_ttl
-                                        :creator_id   api/*current-user-id*}
-                                       (sync.schedules/schedule-map->cron-strings
-                                        (if (:let-user-control-scheduling details)
-                                          (sync.schedules/scheduling schedules)
-                                          (sync.schedules/default-randomized-schedule)))
-                                       (when (some? auto_run_queries)
-                                         {:auto_run_queries auto_run_queries})))))
-        (events/publish-event! :database-create <>)
-        (snowplow/track-event! ::snowplow/database-connection-successful
-                               api/*current-user-id*
-                               {:database engine, :database-id (u/the-id <>), :source :admin}))
-      ;; failed to connect, return error
-      (do
-        (snowplow/track-event! ::snowplow/database-connection-failed
-                               api/*current-user-id*
-                               {:database engine, :source :setup})
-        {:status 400
-         :body   (dissoc details-or-error :valid)}))))
-
-#_{:clj-kondo/ignore [:deprecated-var]}
-(api/defendpoint-schema POST "/validate"
-  "Validate that we can connect to a database given a set of details."
-  ;; TODO - why do we pass the DB in under the key `details`?
-  [:as {{{:keys [engine details]} :details} :body}]
-  {engine  DBEngineString
-   details su/Map}
-  (api/check-superuser)
-  (let [details-or-error (test-connection-details engine details)]
-    {:valid (not (false? (:valid details-or-error)))}))
-
-
-;;; --------------------------------------- POST /api/database/sample_database ----------------------------------------
-
-#_{:clj-kondo/ignore [:deprecated-var]}
-(api/defendpoint-schema POST "/sample_database"
-  "Add the sample database as a new `Database`."
-  []
-  (api/check-superuser)
-  (sample-data/add-sample-database!)
-  (t2/select-one Database :is_sample true))
-
-
-;;; --------------------------------------------- PUT /api/database/:id ----------------------------------------------
-
-(defn upsert-sensitive-fields
-  "Replace any sensitive values not overriden in the PUT with the original values"
-  [database details]
-  (when details
-    (merge (:details database)
-           (reduce
-            (fn [details k]
-              (if (= protected-password (get details k))
-                (m/update-existing details k (constantly (get-in database [:details k])))
-                details))
-            details
-            (database/sensitive-fields-for-db database)))))
-
-#_{:clj-kondo/ignore [:deprecated-var]}
-(api/defendpoint-schema POST "/:id/persist"
-  "Attempt to enable model persistence for a database. If already enabled returns a generic 204."
-  [id]
-  {:id su/IntGreaterThanZero}
-  (api/check (public-settings/persisted-models-enabled)
-             400
-             (tru "Persisting models is not enabled."))
-  (api/let-404 [database (t2/select-one Database :id id)]
-    (api/write-check database)
-    (if (-> database :options :persist-models-enabled)
-      ;; todo: some other response if already persisted?
-      api/generic-204-no-content
-      (let [[success? error] (ddl.i/check-can-persist database)
-            schema           (ddl.i/schema-name database (public-settings/site-uuid))]
-        (if success?
-          ;; do secrets require special handling to not clobber them or mess up encryption?
-          (do (t2/update! Database id {:options (assoc (:options database) :persist-models-enabled true)})
-              (task.persist-refresh/schedule-persistence-for-database!
-                database
-                (public-settings/persisted-model-refresh-cron-schedule))
-              api/generic-204-no-content)
-          (throw (ex-info (ddl.i/error->message error schema)
-                          {:error error
-                           :database (:name database)})))))))
-
-#_{:clj-kondo/ignore [:deprecated-var]}
-(api/defendpoint-schema POST "/:id/unpersist"
-  "Attempt to disable model persistence for a database. If already not enabled, just returns a generic 204."
-  [id]
-  {:id su/IntGreaterThanZero}
-  (api/let-404 [database (t2/select-one Database :id id)]
-    (api/write-check database)
-    (if (-> database :options :persist-models-enabled)
-      (do (t2/update! Database id {:options (dissoc (:options database) :persist-models-enabled)})
-          (persisted-info/mark-for-pruning! {:database_id id})
-          (task.persist-refresh/unschedule-persistence-for-database! database)
-          api/generic-204-no-content)
-      ;; todo: a response saying this was a no-op? an error? same on the post to persist
-      api/generic-204-no-content)))
-
-#_{:clj-kondo/ignore [:deprecated-var]}
-(api/defendpoint-schema PUT "/:id"
-  "Update a `Database`."
-  [id :as {{:keys [name engine details is_full_sync is_on_demand description caveats points_of_interest schedules
-                   auto_run_queries refingerprint cache_ttl settings]} :body}]
-  {name               (s/maybe su/NonBlankString)
-   engine             (s/maybe DBEngineString)
-   refingerprint      (s/maybe s/Bool)
-   details            (s/maybe su/Map)
-   schedules          (s/maybe sync.schedules/ExpandedSchedulesMap)
-   description        (s/maybe s/Str)   ; s/Str instead of su/NonBlankString because we don't care
-   caveats            (s/maybe s/Str)   ; whether someone sets these to blank strings
-   points_of_interest (s/maybe s/Str)
-   auto_run_queries   (s/maybe s/Bool)
-   cache_ttl          (s/maybe su/IntGreaterThanZero)
-   settings           (s/maybe su/Map)}
-  ;; TODO - ensure that custom schedules and let-user-control-scheduling go in lockstep
-  (let [existing-database (api/write-check (t2/select-one Database :id id))
-        details           (some->> details
-                                   (driver.u/db-details-client->server (or engine (:engine existing-database)))
-                                   (upsert-sensitive-fields existing-database))
-        ;; verify that we can connect to the database if `:details` OR `:engine` have changed.
-        details-changed?  (some-> details (not= (:details existing-database)))
-        engine-changed?   (some-> engine keyword (not= (:engine existing-database)))
-        conn-error        (when (or details-changed? engine-changed?)
-                            (test-database-connection (or engine (:engine existing-database))
-                                                      (or details (:details existing-database))))
-        full-sync?        (some-> is_full_sync boolean)]
-    (if conn-error
-      ;; failed to connect, return error
-      {:status 400
-       :body   conn-error}
-      ;; no error, proceed with update
-      (do
-        ;; TODO - is there really a reason to let someone change the engine on an existing database?
-        ;;       that seems like the kind of thing that will almost never work in any practical way
-        ;; TODO - this means one cannot unset the description. Does that matter?
-        (db/update-non-nil-keys! Database id
-                                 (merge
-                                  {:name               name
-                                   :engine             engine
-                                   :details            details
-                                   :refingerprint      refingerprint
-                                   :is_full_sync       full-sync?
-                                   :is_on_demand       (boolean is_on_demand)
-                                   :description        description
-                                   :caveats            caveats
-                                   :points_of_interest points_of_interest
-                                   :auto_run_queries   auto_run_queries}
-                                  ;; upsert settings with a PATCH-style update. `nil` key means unset the Setting.
-                                  (when (seq settings)
-                                    {:settings (into {}
-                                                     (remove (fn [[_k v]] (nil? v)))
-                                                     (merge (:settings existing-database) settings))})
-                                  (cond
-                                    ;; transition back to metabase managed schedules. the schedule
-                                    ;; details, even if provided, are ignored. database is the
-                                    ;; current stored value and check against the incoming details
-                                    (and (get-in existing-database [:details :let-user-control-scheduling])
-                                         (not (:let-user-control-scheduling details)))
-                                    (sync.schedules/schedule-map->cron-strings (sync.schedules/default-randomized-schedule))
-
-                                    ;; if user is controlling schedules
-                                    (:let-user-control-scheduling details)
-                                    (sync.schedules/schedule-map->cron-strings (sync.schedules/scheduling schedules)))))
-        ;; do nothing in the case that user is not in control of
-        ;; scheduling. leave them as they are in the db
-
-        ;; unlike the other fields, folks might want to nil out cache_ttl. it should also only be settable on EE
-        ;; with the advanced-config feature enabled.
-        (when (premium-features/enable-cache-granular-controls?)
-          (t2/update! Database id {:cache_ttl cache_ttl}))
-
-        (let [db (t2/select-one Database :id id)]
-          (events/publish-event! :database-update db)
-          ;; return the DB with the expanded schedules back in place
-          (add-expanded-schedules db))))))
-
-
-;;; -------------------------------------------- DELETE /api/database/:id --------------------------------------------
-
-#_{:clj-kondo/ignore [:deprecated-var]}
-(api/defendpoint-schema DELETE "/:id"
-  "Delete a `Database`."
-  [id]
-  (api/check-superuser)
-  (api/let-404 [db (t2/select-one Database :id id)]
-    (t2/delete! Database :id id)
-    (events/publish-event! :database-delete db))
-  api/generic-204-no-content)
-
 
 ;;; ------------------------------------------ POST /api/database/:id/sync_schema -------------------------------------------
 
@@ -1131,18 +880,12 @@
    (when-not include_editable_data_model
      (api/read-check Database db-id)
      (api/check-403 (can-read-schema? db-id schema)))
-   (let [tables (if include_hidden
-                  (t2/select Table
-                             :db_id db-id
-                             :schema schema
-                             :active true
-                             {:order-by [[:display_name :asc]]})
-                  (t2/select Table
+   (let [tables (t2/select Table
                              :db_id db-id
                              :schema schema
                              :active true
                              :visibility_type nil
-                             {:order-by [[:display_name :asc]]}))]
+                             {:order-by [[:display_name :asc]]})]
      (if include_editable_data_model
        (if-let [f (u/ignore-exceptions
                    (classloader/require 'metabase-enterprise.advanced-permissions.common)
