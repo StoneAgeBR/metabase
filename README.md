@@ -37,36 +37,11 @@ Metabase can be run just about anywhere. Check out our [Installation Guides](htt
 
 In order to spin up a development environment, you need to start the front end and the backend as follows:
 
-### Frontend quick setup
+### Build
 
-The following command will install the Javascript dependencies:
-
-```
-$ yarn install
-```
-
-To build and run without watching changes:
-
-```
-$ yarn build
-```
-
-To build and run with hot-reload:
-
-```
-$ yarn build-hot 
-```
-
-### Backend  quick setup
-
-In order to run the backend, you'll need to build the drivers first, and then start the backend:
-
-```
-$ ./bin/build-drivers.sh
-$ clojure -M:run
-```
-
-For a more detailed setup of a dev environment for Metabase, check out our [Developers Guide](./docs/developers-guide/start.md).
+- Identificar hash do commit desejado
+- Executar manualmente o pipeline Release 1 do actions saindo da branch master, passando tag de versão (tag não pode existir previamente) e hash do commit
+- Após concluir o pipeline 1, executar o pipeline Release 3 com os mesmos parâmetros
 
 ## Internationalization
 
