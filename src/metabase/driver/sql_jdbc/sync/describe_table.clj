@@ -304,7 +304,7 @@
 
 (def ^:const max-nested-field-columns
   "Maximum number of nested field columns."
-  100)
+  200)
 
 (defn- describe-json-rf
   "Reducing function that takes a bunch of maps from row->types,
